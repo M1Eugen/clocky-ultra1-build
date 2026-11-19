@@ -1,0 +1,95 @@
+name: Build Clocky 1.1.3 for Apple Watch Ultra
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 18
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+    steps:
+      - name: Check out Clocky 1.1.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: pookjw/Clocky
+          ref: 923a49bd5efdc454b0b3909d6a4aa6570073357e
+          persist-credentials: false
+
+      - name: Build the companion and embedded watch app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk watchos --show-sdk-version
+          echo 'ARCHS[sdk=watchos*] = arm64_32' > "$RUNNER_TEMP/ultra.xcconfig"
+          echo 'ONLY_ACTIVE_ARCH = NO' >> "$RUNNER_TEMP/ultra.xcconfig"
+          export XCODE_XCCONFIG_FILE="$RUNNER_TEMP/ultra.xcconfig"
+
+          ipa="$GITHUB_WORKSPACE/Clocky-1.1.3-Ultra1.ipa"
+          bash scripts/create_ipa.sh --bundle-id com.example.Clocky --output "$ipa"
+
+          # Some Xcode companion builds filter architectures when embedding the watch app.
+          # If this happened, build the watch target for the device explicitly.
+          bundle='Payload/ClockyCompanion.app/Watch/Clocky.app'
+          unzip -p "$ipa" "$bundle/Clocky" > "$RUNNER_TEMP/embedded-watch"
+          if ! xcrun lipo "$RUNNER_TEMP/embedded-watch" -verify_arch arm64_32; then
+            xcodebuild -project Clocky.xcodeproj -scheme Clocky -configuration Release \
+              -destination 'generic/platform=watchOS' -derivedDataPath "$RUNNER_TEMP/watch-build" \
+              ARCHS=arm64_32 ONLY_ACTIVE_ARCH=NO COMPANION_BUNDLE_IDENTIFIER=com.example.Clocky \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build
+            watch="$RUNNER_TEMP/watch-build/Build/Products/Release-watchos/Clocky.app"
+            xcrun lipo "$watch/Clocky" -verify_arch arm64_32
+            staging="$RUNNER_TEMP/repack"
+            mkdir "$staging"
+            unzip -q "$ipa" 'Payload/*' -x "$bundle/*" -d "$staging"
+            ditto "$watch" "$staging/$bundle"
+            ditto -c -k --keepParent "$staging/Payload" "$RUNNER_TEMP/rebuilt.ipa"
+            mv "$RUNNER_TEMP/rebuilt.ipa" "$ipa"
+          fi
+
+      - name: Verify the packaged programs and watchOS deployment target
+        shell: bash
+        run: |
+          set -euo pipefail
+          ipa="$GITHUB_WORKSPACE/Clocky-1.1.3-Ultra1.ipa"
+          cd "$RUNNER_TEMP"
+          unpacked="$(mktemp -d)"
+          unzip -q "$ipa" 'Payload/*' -d "$unpacked"
+          companion="$unpacked/Payload/ClockyCompanion.app"
+          watch="$companion/Watch/Clocky.app"
+          xcrun lipo "$companion/ClockyCompanion" -verify_arch arm64
+          xcrun lipo "$watch/Clocky" -verify_arch arm64_32
+          xcrun lipo "$watch/Clocky" -archs
+          xcrun vtool -arch arm64_32 -show-build "$watch/Clocky" | tee "$RUNNER_TEMP/clocky-platform.txt"
+          grep -Eq 'platform +WATCHOS$|LC_VERSION_MIN_WATCHOS' "$RUNNER_TEMP/clocky-platform.txt"
+          python3 - "$companion/Info.plist" "$watch/Info.plist" <<'PY'
+          import plistlib
+          import sys
+          from pathlib import Path
+
+          phone, watch = (plistlib.loads(Path(p).read_bytes()) for p in sys.argv[1:])
+          assert "iPhoneOS" in phone["CFBundleSupportedPlatforms"]
+          assert "WatchOS" in watch["CFBundleSupportedPlatforms"]
+          assert watch["WKCompanionAppBundleIdentifier"] == phone["CFBundleIdentifier"]
+          assert watch["CFBundleIdentifier"].startswith(phone["CFBundleIdentifier"] + ".")
+          minimum = tuple(map(int, watch["MinimumOSVersion"].split(".")))
+          assert minimum <= (26, 6, 1), minimum
+          print("Minimum watchOS:", watch["MinimumOSVersion"])
+          PY
+          shasum -a 256 "$ipa"
+
+      - name: Upload the verified unsigned IPA
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Clocky-1.1.3-Ultra1
+          path: Clocky-1.1.3-Ultra1.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
